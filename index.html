@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sony MD Remote</title>
+    <style>
+        body {
+            background-color: #121212;
+            color: #fff;
+            font-family: sans-serif;
+            text-align: center;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100vh;
+            margin: 0;
+        }
+
+        #art {
+            width: 300px;
+            height: 300px;
+            background: #333;
+            margin-bottom: 20px;
+            border-radius: 8px;
+            background-size: cover;
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5);
+        }
+
+        h1 {
+            font-weight: 300;
+            margin: 10px 0;
+            font-size: 1.5rem;
+        }
+
+        h2 {
+            color: #888;
+            font-weight: 300;
+            font-size: 1rem;
+            margin-top: 0;
+        }
+
+        #battery {
+            font-size: 0.8rem;
+            color: #00ff00;
+            border: 1px solid #00ff00;
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-family: monospace;
+        }
+
+        button#connectBtn {
+            padding: 12px 24px;
+            font-size: 1rem;
+            cursor: pointer;
+            background: #0057b8;
+            border: none;
+            color: white;
+            border-radius: 30px;
+            margin-top: 30px;
+            transition: background 0.3s;
+        }
+
+        button#connectBtn:hover {
+            background: #004599;
+        }
+
+        .ctrl {
+            background: transparent;
+            border: 1px solid #444;
+            color: #fff;
+            font-size: 1.5rem;
+            width: 60px;
+            height: 60px;
+            border-radius: 50%;
+            cursor: pointer;
+            transition: background 0.2s;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 0;
+            line-height: 0;
+        }
+
+        .ctrl span {
+            display: block;
+            margin-top: -2px;
+        }
+
+        /* Micro-adjustment for emoji vertical optical center */
+
+        .ctrl:hover {
+            background: #222;
+        }
+
+        .adv {
+            background: #222;
+            border: 1px solid #444;
+            color: #888;
+            font-size: 0.7rem;
+            padding: 10px;
+            border-radius: 4px;
+            cursor: pointer;
+            transition: color 0.2s;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .adv:hover {
+            color: #fff;
+            border-color: #666;
+        }
+    </style>
+</head>
+
+<body>
+
+    <div id="art"></div>
+    <h1 id="track">Not Connected</h1>
+    <h2 id="artist">Tap 'Connect' to Start</h2>
+    <h3 id="disc" style="color: #666; font-weight: normal; font-size: 0.9rem; margin-top: 5px;"></h3>
+    <div id="time" style="margin-top: 15px; font-family: monospace; font-size: 1.2rem; color: #aaa;">--:--</div>
+
+    <!-- Main Controls -->
+    <div style="margin-top: 30px; display: flex; gap: 15px; justify-content: center; width: 100%;">
+        <button class="ctrl" onclick="sendCommand('STOP')"
+            style="font-size: 1rem; color: #ff4444;"><span>⏹</span></button>
+        <button class="ctrl" onclick="sendCommand('PREV')"><span>⏮</span></button>
+        <button class="ctrl" onclick="sendCommand('PLAY')"><span>▶</span></button>
+        <button class="ctrl" onclick="sendCommand('PAUSE')"><span>⏸</span></button>
+        <button class="ctrl" onclick="sendCommand('NEXT')"><span>⏭</span></button>
+    </div>
+
+    <!-- Status Bar -->
+    <div style="margin-top: 25px; display: flex; gap: 20px; align-items: center; font-size: 0.8rem; color: #555;">
+        <div>EQ: <span id="eq" style="color: #888; font-weight: bold;">--</span></div>
+        <div>MODE: <span id="mode" style="color: #888; font-weight: bold;">--</span></div>
+        <div id="battery">--%</div>
+    </div>
+
+    <!-- Advanced Controls -->
+    <div style="margin-top: 15px; display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px; width: 340px;">
+        <button class="adv" onclick="sendCommand('MODE')">MODE</button>
+        <button class="adv" onclick="sendCommand('SOUND')">EQ</button>
+        <button class="adv" onclick="sendCommand('DISPLAY')">INFO</button>
+        <button class="adv" onclick="sendCommand('GRP_PREV')">G-</button>
+        <button class="adv" onclick="sendCommand('GRP_NEXT')">G+</button>
+    </div>
+
+    <button id="connectBtn">Connect to MiniDisc</button>
+
+    <script>
+        const SERVICE_UUID = '0000ffe0-0000-1000-8000-00805f9b34fb'; // Custom Track Info Service
+        const CHAR_UUID = '0000ffe1-0000-1000-8000-00805f9b34fb';    // Track Title (Read/Notify)
+        const CHAR_CMD_UUID = '0000ffe2-0000-1000-8000-00805f9b34fb'; // Command Characteristic (Write) [NEW]
+
+        const BATTERY_SERVICE_UUID = '0000180f-0000-1000-8000-00805f9b34fb'; // Standard Battery Service
+        const BATTERY_CHAR_UUID = '00002a19-0000-1000-8000-00805f9b34fb';    // Battery Level
+
+        let cmdCharacteristic = null;
+
+        document.getElementById('connectBtn').addEventListener('click', async () => {
+            try {
+                const device = await navigator.bluetooth.requestDevice({
+                    filters: [{ name: 'MD_Remote_Adapter' }],
+                    optionalServices: [SERVICE_UUID, BATTERY_SERVICE_UUID]
+                });
+
+                const server = await device.gatt.connect();
+
+                // 1. Setup Track Info
+                try {
+                    const service = await server.getPrimaryService(SERVICE_UUID);
+                    const characteristic = await service.getCharacteristic(CHAR_UUID);
+                    characteristic.startNotifications();
+                    characteristic.addEventListener('characteristicvaluechanged', handleTrackUpdate);
+
+                    // 2. Setup Command Channel
+                    cmdCharacteristic = await service.getCharacteristic(CHAR_CMD_UUID);
+                } catch (e) {
+                    console.log("Track/Command Service not found (Simulator?)");
+                }
+
+
+                // 3. Setup Battery Level
+                try {
+                    const battService = await server.getPrimaryService(BATTERY_SERVICE_UUID);
+                    const battChar = await battService.getCharacteristic(BATTERY_CHAR_UUID);
+
+                    // Initial Read
+                    const initialVal = await battChar.readValue();
+                    updateBattery(initialVal);
+
+                    // Notifications
+                    await battChar.startNotifications();
+                    battChar.addEventListener('characteristicvaluechanged', (event) => {
+                        updateBattery(event.target.value);
+                    });
+                } catch (e) {
+                    console.log("Battery Service not found");
+                    document.getElementById('battery').style.display = 'none';
+                }
+
+                document.getElementById('connectBtn').style.display = 'none';
+                document.getElementById('track').innerText = "Waiting for Data...";
+            } catch (error) {
+                console.error(error);
+                alert("Connection Failed: " + error);
+            }
+        });
+
+        async function sendCommand(cmd) {
+            if (!cmdCharacteristic) {
+                console.log("Not connected");
+                return;
+            }
+            try {
+                const encoder = new TextEncoder();
+                await cmdCharacteristic.writeValue(encoder.encode(cmd));
+                console.log("Sent Command:", cmd);
+            } catch (e) {
+                console.error("Failed to send command", e);
+            }
+        }
+
+        function updateBattery(dataView) {
+            const level = dataView.getUint8(0);
+            const el = document.getElementById('battery');
+            el.innerText = level + "%";
+            if (level < 20) el.style.color = 'red';
+            else el.style.color = '#00ff00';
+            el.style.borderColor = el.style.color;
+        }
+
+        function handleTrackUpdate(event) {
+            const value = new TextDecoder().decode(event.target.value);
+            // New Format: "Artist|Title|Disc|Time|EQ|PlayMode|DebugCmd"
+            // Example: "M83|Midnight City|Hurry Up, We're Dreaming|02:14"
+
+            const parts = value.split("|");
+
+            let artist = "Unknown";
+            let title = value;
+            let disc = "";
+            let time = "--:--";
+            let eq = "--";
+            let mode = "--";
+            let debug = "--";
+
+            if (parts.length >= 2) {
+                artist = parts[0];
+                title = parts[1];
+                if (parts.length > 2) disc = parts[2];
+                if (parts.length > 3) time = parts[3];
+                if (parts.length > 4) eq = parts[4];
+                if (parts.length > 5) mode = parts[5];
+                if (parts.length > 6) debug = parts[6];
+            } else {
+                // Fallback for old "Artist - Title" format
+                const oldParts = value.split(" - ");
+                if (oldParts.length > 1) {
+                    artist = oldParts[0];
+                    title = oldParts[1];
+                }
+            }
+
+            document.getElementById('track').innerText = title;
+            document.getElementById('artist').innerText = artist;
+            document.getElementById('disc').innerText = disc;
+            document.getElementById('time').innerText = time;
+            document.getElementById('eq').innerText = eq;
+            document.getElementById('mode').innerText = mode;
+            document.getElementById('debug').innerText = debug;
+
+            fetchAlbumArt(artist, title);
+        }
+
+        async function fetchAlbumArt(artist, title) {
+            const query = encodeURIComponent(artist + " " + title);
+            const url = `https://itunes.apple.com/search?term=${query}&media=music&limit=1`;
+
+            try {
+                const response = await fetch(url);
+                const data = await response.json();
+                if (data.results.length > 0) {
+                    const artUrl = data.results[0].artworkUrl100.replace('100x100', '600x600');
+                    document.getElementById('art').style.backgroundImage = `url(${artUrl})`;
+                }
+            } catch (e) {
+                console.log("Art fetch failed", e);
+            }
+        }
+    </script>
+</body>
+
+</html>
