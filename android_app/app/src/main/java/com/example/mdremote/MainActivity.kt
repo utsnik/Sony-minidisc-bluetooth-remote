@@ -11,6 +11,7 @@ import android.media.session.PlaybackState
 import android.os.Bundle
 import android.util.Log
 import android.widget.Button
+import android.widget.ImageButton
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
@@ -20,6 +21,7 @@ class MainActivity : AppCompatActivity() {
 
     private var bluetoothAdapter: BluetoothAdapter? = null
     private var bluetoothGatt: BluetoothGatt? = null
+    private var isGattConnected: Boolean = false
     private lateinit var mediaSession: MediaSession
     
     // UUIDs must match your Python script
@@ -57,10 +59,23 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun sendBleCommand(cmd: String) {
-        val service = bluetoothGatt?.getService(SERVICE_UUID)
-        val char = service?.getCharacteristic(UUID.fromString("0000ffe2-0000-1000-8000-00805f9b34fb"))
-        char?.value = cmd.toByteArray()
-        bluetoothGatt?.writeCharacteristic(char)
+        val gatt = bluetoothGatt
+        if (gatt == null || !isGattConnected) {
+            Log.w("MDRemote", "Cannot send command, GATT is not connected")
+            return
+        }
+
+        val service = gatt.getService(SERVICE_UUID) ?: run {
+            Log.w("MDRemote", "BLE service not found")
+            return
+        }
+        val char = service.getCharacteristic(UUID.fromString("0000ffe2-0000-1000-8000-00805f9b34fb")) ?: run {
+            Log.w("MDRemote", "Command characteristic not found")
+            return
+        }
+        char.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+        char.value = cmd.toByteArray()
+        gatt.writeCharacteristic(char)
     }
 
     private fun startBleScan() {
@@ -88,7 +103,10 @@ class MainActivity : AppCompatActivity() {
         bluetoothGatt = device.connectGatt(this, false, object : BluetoothGattCallback() {
             override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
                 if (newState == BluetoothProfile.STATE_CONNECTED) {
+                    isGattConnected = true
                     gatt.discoverServices()
+                } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                    isGattConnected = false
                 }
             }
 
@@ -100,8 +118,8 @@ class MainActivity : AppCompatActivity() {
 
             override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
                 val value = characteristic.getStringValue(0)
-                // Expected format "Artist - Title"
-                val parts = value.split(" - ")
+                // Expected format "Artist|Title"
+                val parts = value.split("|")
                 val artist = if (parts.isNotEmpty()) parts[0] else ""
                 val title = if (parts.size > 1) parts[1] else value
 
