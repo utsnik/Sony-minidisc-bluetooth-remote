@@ -19,16 +19,20 @@ class MiniDiscBluetoothAdapter:
     def start(self):
         print("Starting Sony MiniDisc Bluetooth Adapter...")
 
-        self.remote.start()
+        try:
+            self.remote.start()
 
-        # Uncomment if you want automatic reconnect during startup.
-        # self.bt.pair_headset(BT_HEADSET_MAC)
-        self.bt.setup_a2dp_source()
+            # Uncomment if you want automatic reconnect during startup.
+            # self.bt.pair_headset(BT_HEADSET_MAC)
+            self.bt.setup_a2dp_source()
 
-        self.bt.setup_avrcp_handler(self._handle_headset_command)
-        self.bt.start_ble_service(self.remote.get_status(), self._handle_headset_command)
+            self.bt.setup_avrcp_handler(self._handle_headset_command)
+            self.bt.start_ble_service(self.remote.get_status(), self._handle_headset_command)
 
-        self.is_running = True
+            self.is_running = True
+        except Exception:
+            self.shutdown()
+            raise
 
     def run_main_loop(self):
         while self.is_running:
@@ -63,9 +67,8 @@ class MiniDiscBluetoothAdapter:
         self.shutdown()
 
     def shutdown(self):
-        if not self.is_running:
-            return
         self.is_running = False
+        self.bt.shutdown()
         self.remote.stop()
 
 

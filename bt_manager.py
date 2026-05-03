@@ -36,10 +36,16 @@ A2DP_SINK_UUID = "0000110b-0000-1000-8000-00805f9b34fb"
 SERVICE_UUID = normalize_uuid_str("0000ffe0-0000-1000-8000-00805f9b34fb")
 STATUS_CHAR_UUID = normalize_uuid_str("0000ffe1-0000-1000-8000-00805f9b34fb")
 COMMAND_CHAR_UUID = normalize_uuid_str("0000ffe2-0000-1000-8000-00805f9b34fb")
+BATTERY_SERVICE_UUID = normalize_uuid_str("0000180f-0000-1000-8000-00805f9b34fb")
+BATTERY_LEVEL_CHAR_UUID = normalize_uuid_str("00002a19-0000-1000-8000-00805f9b34fb")
 
 
 def _to_dbus_byte_array(payload: str):
-    return dbus.Array(payload.encode("utf-8"), signature="y")
+    return dbus.Array([dbus.Byte(byte) for byte in payload.encode("utf-8")], signature="y")
+
+
+def _to_dbus_byte_value(value: int):
+    return dbus.Array([dbus.Byte(max(0, min(255, int(value))))], signature="y")
 
 
 if dbus:
@@ -179,23 +185,61 @@ if dbus:
             super().__init__(bus, index, STATUS_CHAR_UUID, ["read", "notify"], service)
             self.notifying = False
             self.value = _to_dbus_byte_array("Unknown|Unknown|||Normal|Normal|0x00")
+            self._lock = threading.Lock()
 
         def update_value(self, payload: str):
-            self.value = _to_dbus_byte_array(payload)
-            if self.notifying:
-                self.PropertiesChanged(GATT_CHRC_IFACE, {"Value": self.value}, [])
+            with self._lock:
+                self.value = _to_dbus_byte_array(payload)
+                value = self.value
+                notifying = self.notifying
+            if notifying:
+                self.PropertiesChanged(GATT_CHRC_IFACE, {"Value": value}, [])
 
         @dbus.service.method(GATT_CHRC_IFACE, in_signature="a{sv}", out_signature="ay")
         def ReadValue(self, options):
-            return self.value
+            with self._lock:
+                return self.value
 
         @dbus.service.method(GATT_CHRC_IFACE)
         def StartNotify(self):
-            self.notifying = True
+            with self._lock:
+                self.notifying = True
 
         @dbus.service.method(GATT_CHRC_IFACE)
         def StopNotify(self):
+            with self._lock:
+                self.notifying = False
+
+
+    class BatteryCharacteristic(Characteristic):
+        def __init__(self, bus, index, service, initial_level=0):
+            super().__init__(bus, index, BATTERY_LEVEL_CHAR_UUID, ["read", "notify"], service)
             self.notifying = False
+            self.value = _to_dbus_byte_value(initial_level)
+            self._lock = threading.Lock()
+
+        def update_value(self, level: int):
+            with self._lock:
+                self.value = _to_dbus_byte_value(level)
+                value = self.value
+                notifying = self.notifying
+            if notifying:
+                self.PropertiesChanged(GATT_CHRC_IFACE, {"Value": value}, [])
+
+        @dbus.service.method(GATT_CHRC_IFACE, in_signature="a{sv}", out_signature="ay")
+        def ReadValue(self, options):
+            with self._lock:
+                return self.value
+
+        @dbus.service.method(GATT_CHRC_IFACE)
+        def StartNotify(self):
+            with self._lock:
+                self.notifying = True
+
+        @dbus.service.method(GATT_CHRC_IFACE)
+        def StopNotify(self):
+            with self._lock:
+                self.notifying = False
 
 
     class CommandCharacteristic(Characteristic):
@@ -212,9 +256,13 @@ if dbus:
         @dbus.service.method(GATT_CHRC_IFACE, in_signature="aya{sv}")
         def WriteValue(self, value, options):
             try:
-                cmd = bytes(value).decode("utf-8").strip().upper()
+                if int(options.get("offset", 0)) != 0:
+                    raise InvalidArgsException("Command writes do not support offsets")
+                cmd = bytes(int(byte) for byte in value).decode("utf-8").strip().upper()
                 if cmd:
                     self.on_command_cb(cmd)
+            except dbus.exceptions.DBusException:
+                raise
             except Exception as exc:
                 raise FailedException(str(exc))
 
@@ -235,7 +283,7 @@ if dbus:
             return {
                 LE_ADVERTISEMENT_IFACE: {
                     "Type": "peripheral",
-                    "ServiceUUIDs": dbus.Array([SERVICE_UUID], signature="s"),
+                    "ServiceUUIDs": dbus.Array([SERVICE_UUID, BATTERY_SERVICE_UUID], signature="s"),
                     "LocalName": dbus.String(self.local_name),
                     "Includes": dbus.Array(["tx-power"], signature="s"),
                 }
@@ -270,6 +318,12 @@ class BluetoothManager:
         self._ble_thread = None
         self._ble_registered = False
         self._status_char = None
+        self._battery_char = None
+        self._gatt_manager = None
+        self._ad_manager = None
+        self._application = None
+        self._advertisement = None
+        self._ble_lock = threading.RLock()
 
     def pair_headset(self, mac_address):
         """Pairs and connects to a Bluetooth headset."""
@@ -364,18 +418,28 @@ class BluetoothManager:
         self.on_command = on_command_cb
 
     def _status_payload_from_state(self, status: Dict) -> str:
-        full_title = status.get("title", "Unknown")
+        def clean_field(value, default=""):
+            text = str(value if value is not None else default)
+            return text.replace("|", "/").replace("\r", " ").replace("\n", " ").strip()
+
+        full_title = clean_field(status.get("title", "Unknown"), "Unknown")
         parts = full_title.split(" - ")
         artist = parts[0] if len(parts) > 1 else "Unknown"
-        title = parts[1] if len(parts) > 1 else full_title
+        title = " - ".join(parts[1:]) if len(parts) > 1 else full_title
 
-        disc = status.get("disc", "")
-        time_str = status.get("time", "--:--")
-        eq = status.get("eq", "Normal")
-        play_mode = status.get("play_mode", "Normal")
-        debug = status.get("debug_cmd", "0x00")
+        disc = clean_field(status.get("disc", ""))
+        time_str = clean_field(status.get("time", "--:--"), "--:--")
+        eq = clean_field(status.get("eq", "Normal"), "Normal")
+        play_mode = clean_field(status.get("play_mode", "Normal"), "Normal")
+        debug = clean_field(status.get("debug_cmd", "0x00"), "0x00")
 
         return f"{artist}|{title}|{disc}|{time_str}|{eq}|{play_mode}|{debug}"
+
+    def _battery_level_from_state(self, status: Dict) -> int:
+        try:
+            return max(0, min(100, int(status.get("battery", 0))))
+        except (TypeError, ValueError):
+            return 0
 
     def start_ble_service(self, track_info, on_command_cb):
         """
@@ -387,9 +451,10 @@ class BluetoothManager:
         if not self._ensure_dbus():
             return False
 
-        if self._ble_registered:
-            self.update_ble_status(track_info)
-            return True
+        with self._ble_lock:
+            if self._ble_registered:
+                self.update_ble_status(track_info)
+                return True
 
         if not GLib:
             print("GLib not available; cannot run BlueZ BLE service.")
@@ -406,42 +471,172 @@ class BluetoothManager:
             ad_manager = dbus.Interface(adapter_obj, LE_ADVERTISEMENT_MANAGER_IFACE)
 
             app = Application(self._bus)
-            service = Service(self._bus, 0, SERVICE_UUID, True)
-            status_char = StatusCharacteristic(self._bus, 0, service)
-            cmd_char = CommandCharacteristic(self._bus, 1, service, on_command_cb)
-            service.add_characteristic(status_char)
-            service.add_characteristic(cmd_char)
-            app.add_service(service)
+            md_service = Service(self._bus, 0, SERVICE_UUID, True)
+            status_char = StatusCharacteristic(self._bus, 0, md_service)
+            cmd_char = CommandCharacteristic(self._bus, 1, md_service, on_command_cb)
+            md_service.add_characteristic(status_char)
+            md_service.add_characteristic(cmd_char)
+            app.add_service(md_service)
+
+            battery_service = Service(self._bus, 1, BATTERY_SERVICE_UUID, True)
+            battery_char = BatteryCharacteristic(
+                self._bus, 0, battery_service, self._battery_level_from_state(track_info)
+            )
+            battery_service.add_characteristic(battery_char)
+            app.add_service(battery_service)
 
             advertisement = Advertisement(self._bus, 0)
 
-            self._status_char = status_char
-            self.update_ble_status(track_info)
+            with self._ble_lock:
+                self._gatt_manager = gatt_manager
+                self._ad_manager = ad_manager
+                self._application = app
+                self._advertisement = advertisement
+                self._status_char = status_char
+                self._battery_char = battery_char
+                self.update_ble_status(track_info)
 
             self._loop = GLib.MainLoop()
+            registered = {"app": False, "ad": False}
+            ready = threading.Event()
 
             def register_objects():
-                gatt_manager.RegisterApplication(app.get_path(), {}, reply_handler=lambda: None, error_handler=lambda e: print(f"BLE app registration failed: {e}"))
-                ad_manager.RegisterAdvertisement(advertisement.get_path(), {}, reply_handler=lambda: None, error_handler=lambda e: print(f"BLE advertisement failed: {e}"))
+                def on_success(kind):
+                    registered[kind] = True
+                    if registered["app"] and registered["ad"]:
+                        with self._ble_lock:
+                            self._ble_registered = True
+                        ready.set()
+
+                def on_error(label, error):
+                    print(f"{label} failed: {error}")
+                    ready.set()
+
+                gatt_manager.RegisterApplication(
+                    app.get_path(),
+                    {},
+                    reply_handler=lambda: on_success("app"),
+                    error_handler=lambda e: on_error("BLE app registration", e),
+                )
+                ad_manager.RegisterAdvertisement(
+                    advertisement.get_path(),
+                    {},
+                    reply_handler=lambda: on_success("ad"),
+                    error_handler=lambda e: on_error("BLE advertisement", e),
+                )
 
             def run_loop():
-                register_objects()
-                self._loop.run()
+                try:
+                    register_objects()
+                    self._loop.run()
+                except Exception as exc:
+                    print(f"BLE GLib loop failed: {exc}")
+                    ready.set()
 
             self._ble_thread = threading.Thread(target=run_loop, daemon=True)
             self._ble_thread.start()
-            self._ble_registered = True
-            return True
+            if not ready.wait(timeout=5.0):
+                print("BLE registration timed out waiting for BlueZ.")
+                self.stop_ble_service()
+                return False
+            with self._ble_lock:
+                if self._ble_registered:
+                    return True
+            self.stop_ble_service()
+            return False
         except Exception as e:
             print(f"BLE service failed to start: {e}")
+            self.stop_ble_service()
             return False
 
     def update_ble_status(self, status):
         """Updates the status characteristic with new track metadata."""
         payload = self._status_payload_from_state(status)
+        battery_level = self._battery_level_from_state(status)
         print(f"[BLE] Broadcasting: {payload}")
-        if self._status_char:
-            self._status_char.update_value(payload)
+        with self._ble_lock:
+            status_char = self._status_char
+            battery_char = self._battery_char
+            loop = self._loop
+
+        def apply_update():
+            if status_char:
+                status_char.update_value(payload)
+            if battery_char:
+                battery_char.update_value(battery_level)
+            return False
+
+        if loop and GLib:
+            GLib.idle_add(apply_update)
+        else:
+            apply_update()
+
+    def stop_ble_service(self):
+        """Unregisters BLE DBus objects and stops the GLib loop."""
+        with self._ble_lock:
+            loop = self._loop
+            thread = self._ble_thread
+            app = self._application
+            advertisement = self._advertisement
+            gatt_manager = self._gatt_manager
+            ad_manager = self._ad_manager
+
+        if not loop:
+            return
+
+        stopped = threading.Event()
+
+        def unregister_and_quit():
+            try:
+                if advertisement and ad_manager:
+                    try:
+                        ad_manager.UnregisterAdvertisement(advertisement.get_path())
+                    except Exception as exc:
+                        print(f"BLE advertisement unregister failed: {exc}")
+                if app and gatt_manager:
+                    try:
+                        gatt_manager.UnregisterApplication(app.get_path())
+                    except Exception as exc:
+                        print(f"BLE app unregister failed: {exc}")
+            finally:
+                with self._ble_lock:
+                    self._ble_registered = False
+                    self._status_char = None
+                    self._battery_char = None
+                    self._application = None
+                    self._advertisement = None
+                    self._gatt_manager = None
+                    self._ad_manager = None
+                loop.quit()
+                stopped.set()
+            return False
+
+        if GLib:
+            GLib.idle_add(unregister_and_quit)
+        else:
+            unregister_and_quit()
+
+        stopped.wait(timeout=3.0)
+        if thread:
+            thread.join(timeout=3.0)
+            if thread.is_alive():
+                print("Warning: BLE GLib thread did not stop within timeout.")
+
+        with self._ble_lock:
+            if not stopped.is_set():
+                self._ble_registered = False
+                self._status_char = None
+                self._battery_char = None
+                self._application = None
+                self._advertisement = None
+                self._gatt_manager = None
+                self._ad_manager = None
+            self._loop = None
+            self._ble_thread = None
+
+    def shutdown(self):
+        self.stop_ble_service()
+        self.is_streaming = False
 
 
 if __name__ == "__main__":

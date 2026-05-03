@@ -162,13 +162,25 @@
         const BATTERY_CHAR_UUID = '00002a19-0000-1000-8000-00805f9b34fb';    // Battery Level
 
         let cmdCharacteristic = null;
+        let connectedDevice = null;
+        let albumArtRequestId = 0;
 
         document.getElementById('connectBtn').addEventListener('click', async () => {
+            const connectBtn = document.getElementById('connectBtn');
+            if (!navigator.bluetooth) {
+                alert("Web Bluetooth is not available in this browser.");
+                return;
+            }
+
+            connectBtn.disabled = true;
+            connectBtn.innerText = "Connecting...";
             try {
                 const device = await navigator.bluetooth.requestDevice({
                     filters: [{ name: 'MD_Remote_Adapter' }],
                     optionalServices: [SERVICE_UUID, BATTERY_SERVICE_UUID]
                 });
+                connectedDevice = device;
+                connectedDevice.addEventListener('gattserverdisconnected', handleDisconnect);
 
                 const server = await device.gatt.connect();
 
@@ -176,13 +188,15 @@
                 try {
                     const service = await server.getPrimaryService(SERVICE_UUID);
                     const characteristic = await service.getCharacteristic(CHAR_UUID);
-                    characteristic.startNotifications();
+                    await characteristic.startNotifications();
                     characteristic.addEventListener('characteristicvaluechanged', handleTrackUpdate);
+                    const initialStatus = await characteristic.readValue();
+                    handleTrackValue(initialStatus);
 
                     // 2. Setup Command Channel
                     cmdCharacteristic = await service.getCharacteristic(CHAR_CMD_UUID);
                 } catch (e) {
-                    console.log("Track/Command Service not found (Simulator?)");
+                    console.log("Track/Command Service not found (Simulator?)", e);
                 }
 
 
@@ -205,11 +219,16 @@
                     document.getElementById('battery').style.display = 'none';
                 }
 
-                document.getElementById('connectBtn').style.display = 'none';
-                document.getElementById('track').innerText = "Waiting for Data...";
+                connectBtn.style.display = 'none';
             } catch (error) {
                 console.error(error);
                 alert("Connection Failed: " + error);
+                handleDisconnect();
+            } finally {
+                if (connectBtn.style.display !== 'none') {
+                    connectBtn.disabled = false;
+                    connectBtn.innerText = "Connect to MiniDisc";
+                }
             }
         });
 
@@ -227,6 +246,24 @@
             }
         }
 
+        function handleDisconnect() {
+            cmdCharacteristic = null;
+            connectedDevice = null;
+            const connectBtn = document.getElementById('connectBtn');
+            connectBtn.style.display = '';
+            connectBtn.disabled = false;
+            connectBtn.innerText = "Connect to MiniDisc";
+            document.getElementById('track').innerText = "Not Connected";
+            document.getElementById('artist').innerText = "Tap 'Connect' to Start";
+            document.getElementById('disc').innerText = "";
+            document.getElementById('time').innerText = "--:--";
+            document.getElementById('eq').innerText = "--";
+            document.getElementById('mode').innerText = "--";
+            document.getElementById('debug').innerText = "--";
+            document.getElementById('battery').innerText = "--%";
+            document.getElementById('battery').style.display = '';
+        }
+
         function updateBattery(dataView) {
             const level = dataView.getUint8(0);
             const el = document.getElementById('battery');
@@ -237,7 +274,11 @@
         }
 
         function handleTrackUpdate(event) {
-            const value = new TextDecoder().decode(event.target.value);
+            handleTrackValue(event.target.value);
+        }
+
+        function handleTrackValue(dataView) {
+            const value = new TextDecoder().decode(dataView);
             // New Format: "Artist|Title|Disc|Time|EQ|PlayMode|DebugCmd"
             // Example: "M83|Midnight City|Hurry Up, We're Dreaming|02:14"
 
@@ -280,15 +321,25 @@
         }
 
         async function fetchAlbumArt(artist, title) {
+            const requestId = ++albumArtRequestId;
+            if (!artist || !title || (artist === "Unknown" && title === "Unknown")) {
+                document.getElementById('art').style.backgroundImage = '';
+                return;
+            }
+
             const query = encodeURIComponent(artist + " " + title);
             const url = `https://itunes.apple.com/search?term=${query}&media=music&limit=1`;
 
             try {
                 const response = await fetch(url);
+                if (!response.ok) return;
                 const data = await response.json();
+                if (requestId !== albumArtRequestId) return;
                 if (data.results.length > 0) {
                     const artUrl = data.results[0].artworkUrl100.replace('100x100', '600x600');
-                    document.getElementById('art').style.backgroundImage = `url(${artUrl})`;
+                    document.getElementById('art').style.backgroundImage = `url("${artUrl}")`;
+                } else {
+                    document.getElementById('art').style.backgroundImage = '';
                 }
             } catch (e) {
                 console.log("Art fetch failed", e);
